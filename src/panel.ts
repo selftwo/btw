@@ -77,7 +77,9 @@ export class BtwSheet implements Focusable {
 	private modelIndex = 0;
 	private modelFilter = "";
 	private lastWindow: WindowInfo = { start: 0, shown: 0, total: 0 };
-	private contentCache: { key: string; lines: string[] } | null = null;
+	private contentCache: { key: string; lines: string[]; latestStart: number } | null = null;
+	/** Line index (in buildContent output) where the latest exchange begins. */
+	private latestStart = 0;
 
 	constructor(theme: Theme, hooks: BtwPanelHooks, mainModelLabel: string, prefill = "") {
 		this.theme = theme;
@@ -326,6 +328,7 @@ export class BtwSheet implements Focusable {
 		// Chat-mode shortcuts.
 		if (matchesKey(data, "tab")) {
 			this.expanded = !this.expanded;
+			if (!this.expanded) this.scroll = 0; // collapsing returns to the latest exchange
 			this.hooks.requestRender();
 			return;
 		}
@@ -355,6 +358,7 @@ export class BtwSheet implements Focusable {
 			return;
 		}
 		if (this.expanded && (matchesKey(data, "up") || matchesKey(data, "ctrl+u") || matchesKey(data, "pageup"))) {
+			// Scroll up into earlier exchanges of this thread.
 			this.scroll += matchesKey(data, "up") ? 3 : 10;
 			this.hooks.requestRender();
 			return;
@@ -382,7 +386,10 @@ export class BtwSheet implements Focusable {
 		const thread = this.currentThread();
 		const msgs = thread?.messages ?? [];
 		const sig = `${width}:${msgs.length}:${msgs.map((m) => m.text.length + m.role[0]).join(",")}`;
-		if (this.contentCache && this.contentCache.key === sig) return this.contentCache.lines;
+		if (this.contentCache && this.contentCache.key === sig) {
+			this.latestStart = this.contentCache.latestStart;
+			return this.contentCache.lines;
+		}
 
 		const th = this.theme;
 		const inner = Math.max(20, width - 2); // 2 cols reserved for the accent bar
@@ -394,6 +401,9 @@ export class BtwSheet implements Focusable {
 		} else {
 			for (const m of msgs) {
 				if (m.role === "user") {
+					// Each user message starts a new exchange; the last one is
+					// what the TUI shows by default (one exchange at a time).
+					this.latestStart = lines.length;
 					const wrapped = wrapTextWithAnsi(m.text, inner - 5);
 					wrapped.forEach((l, i) => {
 						if (i === 0) {
@@ -405,7 +415,7 @@ export class BtwSheet implements Focusable {
 					lines.push("");
 				} else {
 					const md = new Markdown(m.text, 0, 0, mdTheme);
-					for (const l of md.render(inner)) {
+					for (const l of this.fancyMarkdown(md.render(inner), inner)) {
 						lines.push(truncateToWidth(l, width - 2));
 					}
 					lines.push("");
@@ -414,14 +424,63 @@ export class BtwSheet implements Focusable {
 			while (lines.length > 0 && lines[lines.length - 1] === "") lines.pop();
 		}
 
-		this.contentCache = { key: sig, lines };
+		this.contentCache = { key: sig, lines, latestStart: this.latestStart };
 		return lines;
 	}
 
 	/** Accent bar + content line, clipped to width. */
+	/**
+	 * Post-process Markdown render output: turn ``` fences into a bordered
+	 * box (Antigravity-style) and use • for list bullets.
+	 */
+	private fancyMarkdown(lines: string[], inner: number): string[] {
+		const mdTheme = this.mdThemeCache ?? (this.mdThemeCache = getMarkdownTheme());
+		const strip = (s: string) => s.replace(/\x1b\[[0-9;]*m/g, "");
+		// ``` starts a code block (optionally with a language tag); ``` alone ends it.
+		const isFence = (s: string) => { const t = strip(s).trim(); return /^```/.test(t); };
+		const out: string[] = [];
+		let inCode = false;
+		let codeBuf: string[] = [];
+		let codeW = 0;
+		for (const l of lines) {
+			if (isFence(l)) {
+				if (!inCode) {
+					inCode = true;
+					codeBuf = [];
+					codeW = 0;
+				} else {
+					inCode = false;
+					// Borders hug the code content: Markdown pads every line to the
+					// full width, so trim trailing padding before measuring.
+					const bw = Math.max(2, Math.min(codeW, inner - 4));
+					out.push(mdTheme.codeBlockBorder("╭" + "─".repeat(bw) + "╮"));
+					for (const cl of codeBuf) {
+						const body = (cl.startsWith("  ") ? cl.slice(2) : cl).replace(/\s+$/, "");
+						out.push(mdTheme.codeBlock("│ ") + body);
+					}
+					out.push(mdTheme.codeBlockBorder("╰" + "─".repeat(bw) + "╯"));
+					codeBuf = [];
+				}
+				continue;
+			}
+			if (inCode) {
+				const w = strip(l).trimEnd().length;
+				if (w > codeW) codeW = w;
+				codeBuf.push(l);
+			} else {
+				// • bullets, like Antigravity (keep the ANSI prefix, if any)
+				out.push(l.replace(/^(\x1b\[[0-9;]*m)*-\s/, "$1• "));
+			}
+		}
+		if (inCode) out.push(...codeBuf); // unclosed fence: keep as-is
+		return out;
+	}
+
+	private mdThemeCache: ReturnType<typeof getMarkdownTheme> | null = null;
+
 	private barLine(line: string, width: number): string {
 		const th = this.theme;
-		return truncateToWidth(th.fg("accent", "▌") + th.fg("text", " ") + line, width);
+		return truncateToWidth(th.fg("accent", "█") + th.fg("text", " ") + line, width);
 	}
 
 	private hintLine(width: number): string {
@@ -431,11 +490,16 @@ export class BtwSheet implements Focusable {
 		if (this.loading) {
 			parts.push(th.fg("muted", `${SPINNER[this.frame]} generating… (esc to cancel)`));
 		} else if (this.expanded && total > shown) {
-			parts.push(th.fg("dim", `↑↓ to scroll (${start + 1}–${start + shown} of ${total})`));
+			parts.push(th.fg("dim", `↑ older btw · ↓ back (${start + 1}–${start + shown} of ${total})`));
 		}
 		if (!this.loading) {
 			parts.push(th.fg("dim", this.expanded ? "tab collapse · enter/esc dismiss" : "tab expand · enter/esc dismiss"));
 			parts.push(th.fg("dim", "ctrl+y copy · ctrl+l model · ctrl+s save · ctrl+n/p btw"));
+			const t = this.currentThread();
+			if (t) {
+				const label = this.hooks.threadModelLabel(t, this.mainModelLabel);
+				if (label) parts.push(th.fg("accent", label));
+			}
 		}
 		return truncateToWidth(" " + parts.join(th.fg("dim", "  ·  ")), width);
 	}
@@ -450,25 +514,24 @@ export class BtwSheet implements Focusable {
 		const all = this.buildContent(width);
 		const total = all.length;
 
-		let start: number;
-		let view: string[];
-		if (!this.expanded) {
-			// Collapsed: peek from the top of the exchange, like Antigravity.
-			start = 0;
-			view = all.slice(0, maxContent);
-		} else {
-			// Expanded: pinned to the latest unless the user scrolled up.
-			const end = Math.max(0, total - this.scroll);
-			start = Math.max(0, end - maxContent);
-			view = all.slice(start, end);
-		}
+		// One exchange at a time: the view is anchored at the latest exchange
+		// (this.latestStart). Only when that exchange alone is taller than the
+		// viewport do we bottom-pin it; older exchanges appear only by
+		// scrolling up (this.scroll). Collapsed peeks at the latest exchange's
+		// top, like Antigravity.
+		const pinStart = Math.max(0, total - maxContent);
+		const start = Math.max(0, Math.max(this.latestStart, pinStart) - this.scroll);
+		const viewStart = this.expanded ? start : this.latestStart;
+		const view = this.expanded
+			? all.slice(start, Math.min(total, start + maxContent))
+			: all.slice(viewStart, viewStart + maxContent);
 
 		const out: string[] = view.map((l) => this.barLine(l, width));
 
-		if (!this.expanded && total > maxContent) {
+		if (!this.expanded && viewStart + view.length < total) {
 			out.push(truncateToWidth(this.theme.fg("dim", ` … (truncated — tab to expand)`), width));
 		}
-		this.lastWindow = { start, shown: view.length, total };
+		this.lastWindow = { start: viewStart, shown: view.length, total };
 		return out;
 	}
 

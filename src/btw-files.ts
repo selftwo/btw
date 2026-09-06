@@ -175,7 +175,7 @@ function scanMarkdown(dir: string): IndexEntry[] {
 			const stat = fs.statSync(full);
 			const head = fs.readFileSync(full, "utf-8").slice(0, 1500);
 			const title = head.match(/^title:\s*(.+)$/m)?.[1]?.replace(/^"|"$/g, "") ?? f;
-			const updated = head.match(/^updated:\s*(.+)$/m)?.[1] ?? stat.mtime.toISOString();
+			const updated = head.match(/^updated:\s*(.+)$/m)?.[1]?.replace(/^"|"$/g, "") ?? stat.mtime.toISOString();
 			const model = head.match(/^model:\s*(.+)$/m)?.[1]?.replace(/^"|"$/g, "");
 			const session = head.match(/^session:\s*(.+)$/m)?.[1];
 			const messages = Number(head.match(/^messages:\s*(\d+)/m)?.[1]);

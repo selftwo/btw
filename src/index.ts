@@ -91,6 +91,21 @@ interface Choice {
 
 function modelChoices(ctx: ExtensionContext): Choice[] {
 	try {
+		// Prefer the session's scoped models (same set /scoped-models shows,
+		// resolved from --models / the enabledModels setting) so the picker
+		// mirrors the built-in one. Fall back to the full catalogue only when
+		// nothing is scoped.
+		const scoped = (ctx.scopedModels ?? []) as Array<{
+			model: { provider: string; id: string; name?: string };
+		}>;
+		if (scoped.length > 0) {
+			return scoped
+				.map(({ model }) => ({
+					ref: `${model.provider}/${model.id}`,
+					label: `${model.name ?? model.id} (${model.provider}/${model.id})`,
+				}))
+				.sort((a, b) => a.ref.localeCompare(b.ref));
+		}
 		const models = ctx.modelRegistry.getAvailable() as Array<{ id: string; name: string; provider: string }>;
 		return models
 			.map((m) => ({ ref: `${m.provider}/${m.id}`, label: `${m.name} (${m.provider}/${m.id})` }))
