@@ -1,0 +1,11 @@
+{
+  "name": "btw",
+  "version": "0.1.0",
+  "description": "btw for pi: ask without interrupting the main thread, pick a different model, copy fast, revisit history, file notes to btw/",
+  "type": "module",
+  "keywords": ["pi-package"],
+  "license": "MIT",
+  "pi": {
+    "extensions": ["./src/index.ts"]
+  }
+}
