@@ -464,7 +464,8 @@ export class BtwSheet implements Focusable {
 				continue;
 			}
 			if (inCode) {
-				const w = strip(l).trimEnd().length;
+				// measure like we emit: without the markdown 2-space indent, no trailing pad
+				const w = (strip(l).startsWith("  ") ? strip(l).slice(2) : strip(l)).trimEnd().length;
 				if (w > codeW) codeW = w;
 				codeBuf.push(l);
 			} else {
