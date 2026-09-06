@@ -1,0 +1,6 @@
+node_modules/
+btw/
+threads/
+notes/
+index.json
+*.log
