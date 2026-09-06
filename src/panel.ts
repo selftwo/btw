@@ -1,7 +1,9 @@
 import type { Theme } from "@earendil-works/pi-coding-agent";
+import { getMarkdownTheme } from "@earendil-works/pi-coding-agent";
 import {
 	type Focusable,
 	Input,
+	Markdown,
 	matchesKey,
 	truncateToWidth,
 	wrapTextWithAnsi,
@@ -36,18 +38,26 @@ export interface BtwPanelHooks {
 
 type Mode = "chat" | "threads" | "models" | "help";
 
-const VIEW_LINES = 30;
-const SPINNER = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
+/** Lines shown when the sheet is collapsed (Antigravity-style peek). */
+const COLLAPSED_LINES = 7;
+const SPINNER = ["✻", "✽", "✶", "✷"];
+
+/** What slice of the content the last render showed, for the hint line. */
+interface WindowInfo {
+	start: number;
+	shown: number;
+	total: number;
+}
 
 /**
- * Grok-style right-side btw panel.
+ * Antigravity-style btw sheet.
  *
- * Lives in an overlay ({ overlay: true, anchor: "right-center" }), so the
- * main transcript stays visible on the left and the main agent turn keeps
- * running underneath. Dismiss with Esc — the answer never touches the
- * main thread.
+ * A full-width, bottom-docked block with a left accent bar. The main
+ * transcript stays visible above; the exchange renders in-flow with real
+ * markdown. Collapsed by default (Tab expands), ↑↓ scrolls, Esc dismisses.
+ * The answer never touches the main thread.
  */
-export class BtwPanel implements Focusable {
+export class BtwSheet implements Focusable {
 	focused = false;
 
 	private theme: Theme;
@@ -55,6 +65,7 @@ export class BtwPanel implements Focusable {
 	private mainModelLabel: string;
 	private input: Input;
 	private mode: Mode = "chat";
+	private expanded = false;
 	private scroll = 0;
 	private loading = false;
 	private frame = 0;
@@ -65,12 +76,14 @@ export class BtwPanel implements Focusable {
 	private threadIndex = 0;
 	private modelIndex = 0;
 	private modelFilter = "";
+	private lastWindow: WindowInfo = { start: 0, shown: 0, total: 0 };
+	private contentCache: { key: string; lines: string[] } | null = null;
 
 	constructor(theme: Theme, hooks: BtwPanelHooks, mainModelLabel: string, prefill = "") {
 		this.theme = theme;
 		this.hooks = hooks;
 		this.mainModelLabel = mainModelLabel;
-		this.input = new Input({ prompt: "btw> ", placeholder: "Ask btw…  (/help for commands)" });
+		this.input = new Input({ prompt: "btw> ", placeholder: "Ask btw…" });
 		if (prefill) this.input.setValue(prefill);
 		this.input.onSubmit = (value) => void this.handleSubmit(value);
 		this.input.onEscape = () => {
@@ -82,6 +95,7 @@ export class BtwPanel implements Focusable {
 	/** /btw <question>: send immediately instead of waiting for Enter. */
 	submitExternal(question: string): void {
 		if (!question.trim() || this.loading) return;
+		this.expanded = true;
 		void this.handleSubmit(question);
 	}
 
@@ -109,7 +123,7 @@ export class BtwPanel implements Focusable {
 		this.timer = setInterval(() => {
 			this.frame = (this.frame + 1) % SPINNER.length;
 			this.hooks.requestRender();
-		}, 100);
+		}, 120);
 	}
 
 	private stopSpinner(): void {
@@ -147,6 +161,7 @@ export class BtwPanel implements Focusable {
 			case "new":
 				this.hooks.createThread(arg || undefined);
 				this.scroll = 0;
+				this.expanded = true;
 				this.mode = "chat";
 				if (arg) await this.ask(arg);
 				break;
@@ -172,7 +187,7 @@ export class BtwPanel implements Focusable {
 					.modelChoices()
 					.find((m) => m.ref.toLowerCase() === arg.toLowerCase() || m.ref.toLowerCase().endsWith(`/${arg.toLowerCase()}`));
 				if (!found) {
-					this.setNotice(`No model matching "${arg}". Pick from /model list (Ctrl+L).`);
+					this.setNotice(`No model matching "${arg}". Pick from the list (ctrl+l).`);
 					break;
 				}
 				if (thread) {
@@ -198,6 +213,7 @@ export class BtwPanel implements Focusable {
 		thread.messages.push({ role: "user", text: question, ts: Date.now() });
 		this.hooks.touch(thread);
 		this.loading = true;
+		this.expanded = true;
 		this.scroll = 0;
 		this.aborter = new AbortController();
 		this.startSpinner();
@@ -244,7 +260,7 @@ export class BtwPanel implements Focusable {
 	}
 
 	handleInput(data: string): void {
-		// While streaming an answer, Esc / Ctrl+C cancels — main turn untouched.
+		// While streaming, Esc / Ctrl+C cancels — main turn untouched.
 		if (this.loading && (matchesKey(data, "escape") || matchesKey(data, "ctrl+c"))) {
 			this.aborter?.abort();
 			return;
@@ -307,7 +323,12 @@ export class BtwPanel implements Focusable {
 			return;
 		}
 
-		// Chat mode overlay shortcuts (Grok-flavoured).
+		// Chat-mode shortcuts.
+		if (matchesKey(data, "tab")) {
+			this.expanded = !this.expanded;
+			this.hooks.requestRender();
+			return;
+		}
 		if (matchesKey(data, "ctrl+y")) {
 			const thread = this.currentThread();
 			if (thread) void this.hooks.copyLast(thread.id, 1).then((s) => this.setNotice(s));
@@ -333,13 +354,13 @@ export class BtwPanel implements Focusable {
 			this.stepThread(-1);
 			return;
 		}
-		if (matchesKey(data, "ctrl+u") || matchesKey(data, "pageup")) {
-			this.scroll += 10;
+		if (this.expanded && (matchesKey(data, "up") || matchesKey(data, "ctrl+u") || matchesKey(data, "pageup"))) {
+			this.scroll += matchesKey(data, "up") ? 3 : 10;
 			this.hooks.requestRender();
 			return;
 		}
-		if (matchesKey(data, "ctrl+d") || matchesKey(data, "pagedown")) {
-			this.scroll = Math.max(0, this.scroll - 10);
+		if (this.expanded && (matchesKey(data, "down") || matchesKey(data, "ctrl+d") || matchesKey(data, "pagedown"))) {
+			this.scroll = Math.max(0, this.scroll - (matchesKey(data, "down") ? 3 : 10));
 			this.hooks.requestRender();
 			return;
 		}
@@ -349,147 +370,176 @@ export class BtwPanel implements Focusable {
 		this.hooks.requestRender();
 	}
 
-	invalidate(): void {}
+	invalidate(): void {
+		this.contentCache = null;
+	}
 
-	private headerLines(width: number): string[] {
-		const th = this.theme;
+	/**
+	 * Render the full exchange (question + markdown answers) as flat lines.
+	 * Cached per (width, content signature).
+	 */
+	private buildContent(width: number): string[] {
 		const thread = this.currentThread();
-		const threads = this.hooks.getThreads();
-		const model = thread ? this.hooks.threadModelLabel(thread, this.mainModelLabel) : this.mainModelLabel;
-		const title = thread ? thread.title : "btw";
-		const left = ` btw · ${title} `;
-		const right = ` ${model} `;
-		const fillerLen = Math.max(0, width - left.length - right.length);
-		const out: string[] = [
-			truncateToWidth(th.fg("accent", left) + th.fg("dim", "─".repeat(fillerLen)) + th.fg("muted", right), width),
-		];
-		if (threads.length > 1) {
-			const tabs = threads
-				.slice(0, 5)
-				.map((t, i) => {
-					const active = t.id === this.hooks.getSelectedId();
-					const label = `[${i + 1}] ${t.title.length > 14 ? `${t.title.slice(0, 13)}…` : t.title}`;
-					return active ? th.fg("accent", label) : th.fg("dim", label);
-				})
-				.join(th.fg("dim", " │ "));
-			const extra = threads.length > 5 ? th.fg("dim", ` (+${threads.length - 5})`) : "";
-			out.push(truncateToWidth(` ${tabs}${extra}`, width));
+		const msgs = thread?.messages ?? [];
+		const sig = `${width}:${msgs.length}:${msgs.map((m) => m.text.length + m.role[0]).join(",")}`;
+		if (this.contentCache && this.contentCache.key === sig) return this.contentCache.lines;
+
+		const th = this.theme;
+		const inner = Math.max(20, width - 2); // 2 cols reserved for the accent bar
+		const mdTheme = getMarkdownTheme();
+		const lines: string[] = [];
+
+		if (msgs.length === 0) {
+			lines.push(th.fg("dim", "Ask btw anything — the main task keeps running."));
+		} else {
+			for (const m of msgs) {
+				if (m.role === "user") {
+					const wrapped = wrapTextWithAnsi(m.text, inner - 5);
+					wrapped.forEach((l, i) => {
+						if (i === 0) {
+							lines.push(truncateToWidth(th.fg("accent", th.bold("/btw ")) + th.fg("text", l), width - 2));
+						} else {
+							lines.push(truncateToWidth(th.fg("text", `     ${l}`), width - 2));
+						}
+					});
+					lines.push("");
+				} else {
+					const md = new Markdown(m.text, 0, 0, mdTheme);
+					for (const l of md.render(inner)) {
+						lines.push(truncateToWidth(l, width - 2));
+					}
+					lines.push("");
+				}
+			}
+			while (lines.length > 0 && lines[lines.length - 1] === "") lines.pop();
 		}
+
+		this.contentCache = { key: sig, lines };
+		return lines;
+	}
+
+	/** Accent bar + content line, clipped to width. */
+	private barLine(line: string, width: number): string {
+		const th = this.theme;
+		return truncateToWidth(th.fg("accent", "▌") + th.fg("text", " ") + line, width);
+	}
+
+	private hintLine(width: number): string {
+		const th = this.theme;
+		const { start, shown, total } = this.lastWindow;
+		const parts: string[] = [];
+		if (this.loading) {
+			parts.push(th.fg("muted", `${SPINNER[this.frame]} generating… (esc to cancel)`));
+		} else if (this.expanded && total > shown) {
+			parts.push(th.fg("dim", `↑↓ to scroll (${start + 1}–${start + shown} of ${total})`));
+		}
+		if (!this.loading) {
+			parts.push(th.fg("dim", this.expanded ? "tab collapse · enter/esc dismiss" : "tab expand · enter/esc dismiss"));
+			parts.push(th.fg("dim", "ctrl+y copy · ctrl+l model · ctrl+s save · ctrl+n/p btw"));
+		}
+		return truncateToWidth(" " + parts.join(th.fg("dim", "  ·  ")), width);
+	}
+
+	private chatLines(width: number): string[] {
+		const rows = process.stdout?.rows ?? 40;
+		// Keep the sheet inside the overlay's maxHeight (80% of the terminal)
+		// with room for the input line, notice and hint line, so the bottom
+		// (keybindings) is never clipped.
+		const cap = Math.max(10, Math.min(Math.floor(rows * 0.8) - 5, rows - 7, 38));
+		const maxContent = this.expanded ? cap : COLLAPSED_LINES;
+		const all = this.buildContent(width);
+		const total = all.length;
+
+		let start: number;
+		let view: string[];
+		if (!this.expanded) {
+			// Collapsed: peek from the top of the exchange, like Antigravity.
+			start = 0;
+			view = all.slice(0, maxContent);
+		} else {
+			// Expanded: pinned to the latest unless the user scrolled up.
+			const end = Math.max(0, total - this.scroll);
+			start = Math.max(0, end - maxContent);
+			view = all.slice(start, end);
+		}
+
+		const out: string[] = view.map((l) => this.barLine(l, width));
+
+		if (!this.expanded && total > maxContent) {
+			out.push(truncateToWidth(this.theme.fg("dim", ` … (truncated — tab to expand)`), width));
+		}
+		this.lastWindow = { start, shown: view.length, total };
 		return out;
 	}
 
-	private transcriptLines(width: number): string[] {
+	private renderThreads(width: number): string[] {
 		const th = this.theme;
-		const thread = this.currentThread();
-		if (!thread || thread.messages.length === 0) {
-			return [th.fg("dim", " No btw yet. Ask anything — the main task keeps running."), ""];
-		}
-		const inner = Math.max(20, width - 4);
-		const all: string[] = [];
-		for (const m of thread.messages) {
-			if (m.role === "user") {
-				all.push(truncateToWidth(th.fg("accent", "You"), width));
-				for (const line of wrapTextWithAnsi(m.text, inner)) {
-					all.push(truncateToWidth(`  ${line}`, width));
-				}
-			} else {
-				all.push(truncateToWidth(th.fg("success", "btw"), width));
-				for (const line of wrapTextWithAnsi(m.text, inner)) {
-					all.push(truncateToWidth(`  ${line}`, width));
-				}
-			}
-			all.push("");
-		}
-		if (all.length > 0) all.pop();
-
-		// Window the transcript so the panel always fits the overlay.
-		const total = all.length;
-		const end = Math.max(0, total - this.scroll);
-		const start = Math.max(0, end - VIEW_LINES);
-		const view = all.slice(start, Math.max(start, end));
-		if (start > 0) view.unshift(th.fg("dim", `↑ ${start} more lines above (ctrl+u scrolls)`));
-		if (end < total) view.push(th.fg("dim", `↓ ${total - end} more lines below (ctrl+d scrolls)`));
-		return view;
+		const threads = this.hooks.getThreads();
+		const out: string[] = [th.fg("accent", " btw chats in this session")];
+		threads.slice(0, 12).forEach((t, i) => {
+			const sel = i === this.threadIndex;
+			const active = t.id === this.hooks.getSelectedId();
+			const marker = sel ? "▶ " : "  ";
+			const flag = active ? " ●" : "";
+			const label = `${marker}[${i + 1}] ${t.title} (${t.messages.length} msgs)${flag}`;
+			out.push(truncateToWidth(sel ? th.fg("accent", label) : th.fg("text", label), width));
+		});
+		out.push("", truncateToWidth(th.fg("dim", " ↑↓ pick · enter open · n new · esc back"), width));
+		return out;
 	}
 
-	private footerLines(width: number): string[] {
+	private renderModels(width: number): string[] {
 		const th = this.theme;
-		const hints: string[] =
-			this.mode === "chat"
-				? ["enter send · esc close · ctrl+y copy · ctrl+l model · ctrl+s save · ctrl+n/p btw · /help"]
-				: this.mode === "threads"
-					? ["↑↓ pick · enter open · n new · esc back"]
-					: this.mode === "models"
-						? ["type to filter · ↑↓ pick · enter use · esc back"]
-						: ["any key back"];
-		const out = hints.map((h) => truncateToWidth(th.fg("dim", ` ${h}`), width));
-		if (this.notice) out.push(truncateToWidth(th.fg("warning", ` ${this.notice}`), width));
+		const list = this.filteredModels().slice(0, 12);
+		const out: string[] = [th.fg("accent", ` model for this btw (filter: ${this.modelFilter || "—"})`)];
+		list.forEach((m, i) => {
+			const label = `${i === this.modelIndex ? "▶ " : "  "}${m.label}`;
+			out.push(truncateToWidth(i === this.modelIndex ? th.fg("accent", label) : th.fg("text", label), width));
+		});
+		if (list.length === 0) out.push(th.fg("dim", "  no match"));
+		out.push("", truncateToWidth(th.fg("dim", " type to filter · ↑↓ pick · enter use · esc back"), width));
+		return out;
+	}
+
+	private renderHelp(width: number): string[] {
+		const th = this.theme;
+		const out: string[] = [];
+		for (const h of [
+			"Ask anything — the main task keeps running underneath.",
+			"",
+			"/save [title]   file the last answer to btw/notes/",
+			"/copy [n]       copy the last (or nth) answer to clipboard",
+			"/model [ref]    use a different model for this btw",
+			"/threads        revisit every btw in this session",
+			"/new [question] start a fresh btw",
+			"/close          dismiss (esc does this too)",
+		]) {
+			out.push(truncateToWidth(th.fg("text", ` ${h}`), width));
+		}
+		out.push("", truncateToWidth(th.fg("dim", " any key back"), width));
 		return out;
 	}
 
 	render(width: number): string[] {
 		const w = Math.max(30, width);
-		const lines: string[] = [...this.headerLines(w), ""];
-		if (this.mode === "threads") {
-			const threads = this.hooks.getThreads();
-			lines.push(this.theme.fg("accent", " btw chats in this session"));
-			threads.slice(0, 12).forEach((t, i) => {
-				const sel = i === this.threadIndex;
-				const active = t.id === this.hooks.getSelectedId();
-				const marker = sel ? "▶ " : "  ";
-				const flag = active ? " ●" : "";
-				const label = `${marker}[${i + 1}] ${t.title} (${t.messages.length} msgs)${flag}`;
-				lines.push(
-					truncateToWidth(sel ? this.theme.fg("accent", label) : this.theme.fg("text", label), w),
-				);
-			});
-			lines.push("", ...this.footerLines(w));
-			return lines;
-		}
-		if (this.mode === "models") {
-			const list = this.filteredModels().slice(0, 12);
-			lines.push(this.theme.fg("accent", ` model for this btw (filter: ${this.modelFilter || "—"})`));
-			list.forEach((m, i) => {
-				const label = `${i === this.modelIndex ? "▶ " : "  "}${m.label}`;
-				lines.push(
-					truncateToWidth(i === this.modelIndex ? this.theme.fg("accent", label) : this.theme.fg("text", label), w),
-				);
-			});
-			if (list.length === 0) lines.push(this.theme.fg("dim", "  no match"));
-			lines.push("", ...this.footerLines(w));
-			return lines;
-		}
-		if (this.mode === "help") {
-			for (const h of [
-				"Ask anything — the main task keeps running underneath.",
-				"",
-				"/save [title]   file the last answer to btw/notes/",
-				"/copy [n]       copy the last (or nth) answer to clipboard",
-				"/model [ref]    use a different model for this btw",
-				"/threads        revisit every btw in this session",
-				"/new [question] start a fresh btw",
-				"/close          dismiss (esc does this too)",
-				"",
-				"ctrl+y copy · ctrl+l model · ctrl+s save · ctrl+n/p switch btw",
-				"ctrl+u / ctrl+d scroll the transcript",
-			]) {
-				lines.push(truncateToWidth(this.theme.fg("text", ` ${h}`), w));
+		let body: string[];
+		if (this.mode === "threads") body = this.renderThreads(w);
+		else if (this.mode === "models") body = this.renderModels(w);
+		else if (this.mode === "help") body = this.renderHelp(w);
+		else body = this.chatLines(w);
+
+		const lines: string[] = [...body, ""];
+
+		if (this.mode === "chat") {
+			this.input.focused = this.focused;
+			for (const line of this.input.render(w)) {
+				lines.push(truncateToWidth(line, w));
 			}
-			lines.push("", ...this.footerLines(w));
-			return lines;
 		}
-		lines.push(...this.transcriptLines(w), "");
-		if (this.loading) {
-			lines.push(
-				truncateToWidth(this.theme.fg("muted", ` ${SPINNER[this.frame]} thinking… (esc cancels)`), w),
-				"",
-			);
+		if (this.notice) lines.push(truncateToWidth(this.theme.fg("warning", ` ${this.notice}`), w));
+		if (this.mode === "chat") {
+			lines.push(this.hintLine(w));
 		}
-		this.input.focused = this.focused;
-		for (const line of this.input.render(w)) {
-			lines.push(truncateToWidth(line, w));
-		}
-		lines.push(...this.footerLines(w));
 		return lines;
 	}
 }

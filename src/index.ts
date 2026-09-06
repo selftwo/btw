@@ -1,7 +1,7 @@
 /**
  * btw — ask without interrupting the main thread.
  *
- * /btw <question>      ask btw (overlay panel, main turn keeps running)
+ * /btw <question>      ask btw (bottom sheet, main turn keeps running)
  * /btw-list            revisit every btw in this session
  * /btw-copy [n]        copy the last (or nth) btw answer to clipboard
  * /btw-save [title]    file the last btw answer to btw/notes/
@@ -18,7 +18,7 @@ import { getAgentDir } from "@earendil-works/pi-coding-agent";
 import { copyTextToClipboard } from "./clipboard.ts";
 import { buildMainContextSnapshot, buildSideSystemPrompt } from "./context.ts";
 import { ensureBtwDir, saveNoteFile, writeThreadFile } from "./btw-files.ts";
-import { BtwPanel, type BtwCloseResult } from "./panel.ts";
+import { BtwSheet, type BtwCloseResult } from "./panel.ts";
 import { SideStore, type SideThread } from "./store.ts";
 
 const STATUS_KEY = "btw";
@@ -209,7 +209,7 @@ async function openBtw(
 
 	const result = await ctx.ui.custom<BtwCloseResult>(
 		(tui, theme, _kb, done) => {
-			const panel = new BtwPanel(
+			const panel = new BtwSheet(
 				theme,
 				{
 					getThreads: () => store.list(),
@@ -283,10 +283,9 @@ async function openBtw(
 		{
 			overlay: true,
 			overlayOptions: {
-				anchor: "right-center",
-				width: "52%",
-				minWidth: 58,
-				maxHeight: "88%",
+				anchor: "bottom-center",
+				width: "100%",
+				maxHeight: "80%",
 			},
 		},
 	);
@@ -325,7 +324,7 @@ export default function (pi: ExtensionAPI) {
 	}
 
 	pi.registerCommand("btw", {
-		description: "Ask btw without interrupting the main task (right-side panel)",
+		description: "Ask btw without interrupting the main task (side sheet)",
 		getArgumentCompletions: (prefix) => {
 			const opts = ["--model ", "help"];
 			const hit = opts.filter((o) => o.startsWith(prefix));
